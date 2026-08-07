@@ -104,6 +104,10 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   matching project source (such as MDX, TSX, or a template), apply every edit
   and deletion there, then acknowledge so the route reloads. Never write the
   rendered HTTP response back into the app.
+- When an edit's `after_html` contains `<img src="assets/...">`, the user pasted
+  an image: the file already exists in an `assets/` folder next to the reviewed
+  file. Keep that relative path — in Markdown, reference it as
+  `![](assets/...)`. Never regenerate or inline the image.
 - An edit with `kind: "moved"` means the user relocated that whole block.
   Reposition it in the source without rewriting its content: it now sits right
   after the block whose text starts with `moved_after`, and right before the

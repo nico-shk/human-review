@@ -1273,6 +1273,58 @@ function boot() {
     flushSave();
   });
 
+  // ------------------------------------------------------------- image paste
+
+  // Pasted images cross to the chrome page as bytes; the server writes them
+  // into assets/ next to the reviewed file and the confirmed relative path
+  // comes back to be inserted where the caret was.
+  let pasteSeq = 0;
+  const pendingPastes = new Map(); // id → collapsed caret range to insert at
+
+  document.addEventListener(
+    "paste",
+    (event) => {
+      if (isOurs(event.target)) return;
+      const items = event.clipboardData ? [...event.clipboardData.items] : [];
+      const images = items.filter((item) => item.kind === "file" && /^image\//.test(item.type));
+      if (!images.length) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const sel = document.getSelection();
+      const caret = sel && sel.rangeCount ? sel.getRangeAt(0).cloneRange() : null;
+      for (const item of images) {
+        const file = item.getAsFile();
+        if (!file) continue;
+        pasteSeq += 1;
+        const id = `paste_${pasteSeq}`;
+        pendingPastes.set(id, caret);
+        file.arrayBuffer().then((bytes) => post("eh:asset", { id, assetType: file.type, bytes }));
+      }
+    },
+    true
+  );
+
+  const insertPastedImage = (id, src) => {
+    const caret = pendingPastes.get(id);
+    pendingPastes.delete(id);
+    userEdited = true;
+    const img = document.createElement("img");
+    img.setAttribute("src", src);
+    img.style.maxWidth = "100%";
+    const anchored = caret && caret.startContainer && document.body.contains(caret.startContainer) && !isOurs(caret.startContainer);
+    if (anchored) {
+      const target = targetFor(caret.startContainer);
+      if (target) captureOriginal(target.el);
+      caret.collapse(false);
+      caret.insertNode(img);
+    } else {
+      document.body.appendChild(img);
+    }
+    const landed = targetFor(img);
+    emitBlockEdit(landed ? landed.el : img, landed ? landed.label : "Pasted image");
+    flushSave();
+  };
+
   document.addEventListener("input", (event) => {
     if (isOurs(event.target)) return;
     // A drop fires deleteByDrag/insertFromDrop input events whose selection
@@ -1385,6 +1437,12 @@ function boot() {
         break;
       case "eh:restoreScroll":
         window.scrollTo(msg.x || 0, msg.y || 0);
+        break;
+      case "eh:assetSaved":
+        insertPastedImage(msg.id, String(msg.src || ""));
+        break;
+      case "eh:assetFailed":
+        pendingPastes.delete(msg.id);
         break;
       default:
         break;
