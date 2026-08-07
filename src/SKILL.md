@@ -104,6 +104,11 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   matching project source (such as MDX, TSX, or a template), apply every edit
   and deletion there, then acknowledge so the route reloads. Never write the
   rendered HTTP response back into the app.
+- An edit with `kind: "moved"` means the user relocated that whole block.
+  Reposition it in the source without rewriting its content: it now sits right
+  after the block whose text starts with `moved_after`, and right before the
+  block whose text starts with `moved_before`. An empty `moved_after` means it
+  is now the first block in its container.
 - Find each comment by its `quote`; that exact string is in the file.
 - `kind: "element"` points at a whole block, so `quote` is its label, not body text.
 - Fix every page in `pages`, not just the first.

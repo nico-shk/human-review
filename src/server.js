@@ -633,9 +633,11 @@ export function createServer() {
         if (action === "edit" && req.method === "POST") {
           const body = await readBody(req);
           const label = String(body.label || "Document");
-          const kind = body.kind === "deleted" ? "deleted" : "edited";
+          const kind = body.kind === "deleted" ? "deleted" : body.kind === "moved" ? "moved" : "edited";
           const cap = (s) => (typeof s === "string" ? s.slice(0, 4000) : undefined);
-          store.addEdit(key, label, kind, cap(body.before), cap(body.after), cap(body.before_html), cap(body.after_html));
+          const extra =
+            kind === "moved" ? { moved_after: cap(body.moved_after) || "", moved_before: cap(body.moved_before) || "" } : undefined;
+          store.addEdit(key, label, kind, cap(body.before), cap(body.after), cap(body.before_html), cap(body.after_html), extra);
           return json(res, 200, { page: pageState(key) });
         }
 
