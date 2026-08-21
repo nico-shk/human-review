@@ -4,7 +4,7 @@ import http from "node:http";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { canonicalTarget, ensureStateDir, SERVER_PROTOCOL, serverPath, statePath, targetKey } from "./paths.js";
+import { archiveDir, canonicalTarget, ensureStateDir, journalPath, SERVER_PROTOCOL, serverPath, statePath, targetKey } from "./paths.js";
 import { installSkills, shellQuote } from "./setup.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -17,6 +17,8 @@ const HELP = `human-review ${pkg.version}
       --ack                        Acknowledge the last batch, then keep waiting
       --timeout <secs>             Exit with {"status":"timeout"} if nothing arrives
   human-review status <target>        Report whether feedback is waiting, without blocking
+  human-review history [target]       List archived feedback batches (all targets when omitted)
+      --show <index-or-stamp>      Print one archived batch in full
   human-review setup                  Teach Claude Code / Codex how to use human-review
   human-review setup --global         ...for every project, not just this one
 
@@ -69,10 +71,30 @@ async function alive(port) {
   }
 }
 
+function pidAlive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function ensureServer() {
   ensureStateDir();
   const saved = readServerRecord();
-  if (saved?.protocol === SERVER_PROTOCOL && saved.port && (await alive(saved.port))) return saved;
+  if (saved?.protocol === SERVER_PROTOCOL && saved.port) {
+    if (await alive(saved.port)) return saved;
+    // The recorded pid still running means the server exists but missed one
+    // 1200ms health window. Spawning now would seed a duplicate owner of
+    // server.json, so keep retrying while the pid is alive (~10s) and only
+    // spawn once it is provably dead or never answers.
+    for (let attempt = 0; attempt < 8 && pidAlive(saved.pid); attempt += 1) {
+      await new Promise((r) => setTimeout(r, 1000));
+      if (await alive(saved.port)) return saved;
+    }
+  }
 
   const child = spawn(process.execPath, [path.join(here, "server-entry.js")], {
     detached: true,
@@ -253,6 +275,80 @@ async function statusCommand(input) {
   process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
 }
 
+/**
+ * Everything below reads the archive and journal straight from disk — lost or
+ * unclear feedback stays recoverable even with no server running.
+ */
+function readJournalLines() {
+  try {
+    return fs
+      .readFileSync(journalPath(), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function listArchives(key) {
+  let names = [];
+  try {
+    names = fs.readdirSync(archiveDir()).filter((n) => n.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  names.sort();
+  const out = [];
+  for (const name of names) {
+    let record;
+    try {
+      record = JSON.parse(fs.readFileSync(path.join(archiveDir(), name), "utf8"));
+    } catch {
+      continue;
+    }
+    if (key && record.entryKey !== key) continue;
+    out.push({ name, ...record });
+  }
+  return out;
+}
+
+async function historyCommand(input, show) {
+  const key = input ? targetKey(canonicalTarget(input).value) : "";
+  const archives = listArchives(key);
+  if (show) {
+    const index = /^\d+$/.test(show) ? Number(show) : archives.findIndex((a) => a.name.startsWith(show));
+    const record = archives[index];
+    if (!record) throw new Error(`No archived batch matches "${show}". Run \`human-review history\` to list them.`);
+    process.stdout.write(`${JSON.stringify(record, null, 2)}\n`);
+    return;
+  }
+  const acks = readJournalLines().filter((line) => line.event === "batch_acked");
+  const listing = archives.map((record, index) => {
+    const batch = record.batch || {};
+    const pages = batch.pages || [];
+    return {
+      index,
+      archive: record.name,
+      entry_key: record.entryKey,
+      target: pages[0]?.file || "",
+      sent_at: batch.sent_at || record.archived_at,
+      pages: pages.length,
+      comments: pages.reduce((n, p) => n + (p.comments || []).length, 0),
+      edits: pages.reduce((n, p) => n + (p.edits || []).length, 0),
+      acked: acks.some((line) => line.key === record.entryKey && line.ts >= (batch.sent_at || "")),
+    };
+  });
+  process.stdout.write(`${JSON.stringify({ batches: listing }, null, 2)}\n`);
+}
+
 // ---------------------------------------------------------------------- main
 
 const argv = process.argv.slice(2);
@@ -303,6 +399,17 @@ try {
     const file = argv.find((a, i) => i > 0 && !a.startsWith("-"));
     if (!file) throw new Error("Usage: human-review status <file-or-localhost-url>");
     await statusCommand(file);
+  } else if (argv[0] === "history") {
+    const rest = argv.slice(1);
+    let show = "";
+    let file = "";
+    for (let i = 0; i < rest.length; i += 1) {
+      const arg = rest[i];
+      if (arg === "--show") show = String(rest[(i += 1)] || "");
+      else if (arg.startsWith("--show=")) show = arg.slice("--show=".length);
+      else if (!arg.startsWith("-") && !file) file = arg;
+    }
+    await historyCommand(file, show);
   } else if (argv[0] === "setup") {
     const isGlobal = argv.includes("--global") || argv.includes("-g");
     installSkills(process.cwd(), { global: isGlobal }).forEach((line) => console.log(line));

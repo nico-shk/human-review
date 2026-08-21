@@ -3,10 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { atomicWrite, Store, resolveAsset } from "./state.js";
+import { archiveBatch, atomicWrite, journal, Store, resolveAsset } from "./state.js";
 import { injectSdk, stripSdk } from "./html-transform.js";
 import { isMarkdown, renderMarkdownPage } from "./markdown.js";
-import { canonicalTarget, ensureStateDir, localUrl, SERVER_PROTOCOL, serverPath, stateDir, targetKey } from "./paths.js";
+import { canonicalTarget, ensureStateDir, loadOrCreateToken, localUrl, SERVER_PROTOCOL, serverPath, stateDir, targetKey } from "./paths.js";
 import { invocation, shellQuote } from "./setup.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -38,7 +38,7 @@ const POLL_HEARTBEAT_MS = 15000;
 const WATCH_INTERVAL_MS = 400;
 const IDLE_SHUTDOWN_MS = Number(process.env.HUMAN_REVIEW_IDLE_MS || 45 * 60 * 1000);
 /** A window with no live connection this long is treated as closed for good. */
-const SESSION_TTL_MS = 30 * 60 * 1000;
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_LOCAL_REDIRECTS = 5;
 /** Generous enough for a dev server's cold compile, but a wedged one can't hang us forever. */
 const LOCAL_FETCH_TIMEOUT_MS = 30000;
@@ -99,13 +99,15 @@ export function createServer() {
   const cliInvocation = invocation();
 
   /**
-   * Random per-run secret. Every /api route requires it, so a malicious web
+   * Per-user secret. Every /api route requires it, so a malicious web
    * page firing blind cross-origin POSTs at 127.0.0.1 cannot write files.
+   * Persisted in the state dir (mode 0600) and reused across runs, so a
+   * restart never invalidates the token already injected into open tabs.
    * The CLI reads it from server.json; the chrome page gets it injected.
    */
-  const token = crypto.randomBytes(16).toString("hex");
+  const token = loadOrCreateToken();
 
-  /** Browser windows. Ephemeral — nothing durable lives here. */
+  /** Browser windows, mirrored to the store so tabs survive restarts. */
   const sessions = new Map(); // sessionId -> { id, entryKey, activeKey, visited, clients:Set<res>, lastSeen }
   /** Agent long-polls, keyed by the entry page they were started on. */
   const pollers = new Map(); // entryKey -> Set<{ res, timer }>
@@ -115,6 +117,20 @@ export function createServer() {
   );
   const watched = new Map(); // key -> { file }
   const lastWritten = new Map(); // key -> content hash human-review itself wrote
+
+  // Revive sessions persisted by earlier runs: open tabs reconnect instead of
+  // dying with "This review session has ended".
+  for (const [id, record] of Object.entries(store.allSessions())) {
+    sessions.set(id, {
+      id,
+      entryKey: record.entryKey,
+      activeKey: record.activeKey,
+      visited: new Set(record.visited || []),
+      clients: new Set(),
+      lastSeen: Date.now(),
+    });
+    for (const key of record.visited || []) watchPage(key);
+  }
 
   let lastActivity = Date.now();
   const touch = () => {
@@ -132,6 +148,47 @@ export function createServer() {
 
   function sessionsForEntry(entryKey) {
     return [...sessions.values()].filter((s) => s.entryKey === entryKey);
+  }
+
+  /**
+   * Look a session up in memory, falling back to the store — a record another
+   * instance persisted after this one started is revived, not 404'd.
+   */
+  function getSession(id) {
+    const live = sessions.get(id);
+    if (live) return live;
+    const record = store.session(id);
+    if (!record) return null;
+    const revived = {
+      id,
+      entryKey: record.entryKey,
+      activeKey: record.activeKey,
+      visited: new Set(record.visited || []),
+      clients: new Set(),
+      lastSeen: Date.now(),
+    };
+    sessions.set(id, revived);
+    for (const key of revived.visited) watchPage(key);
+    return revived;
+  }
+
+  const persistSession = (session) =>
+    store.setSession(session.id, { entryKey: session.entryKey, activeKey: session.activeKey, visited: session.visited });
+
+  /** Journal-friendly name for a page: its file path or localhost URL. */
+  function targetOf(key) {
+    const page = store.page(key);
+    return page ? (page.kind === "url" ? page.url : page.file) : "";
+  }
+
+  /** Does this window still guard unsent feedback or an unacked batch? */
+  function sessionHasWork(session) {
+    if (batches.has(session.entryKey)) return true;
+    for (const key of session.visited) {
+      const page = store.page(key);
+      if (page && (page.comments.length || page.edits.length)) return true;
+    }
+    return false;
   }
 
   function emit(session, event, data) {
@@ -201,6 +258,7 @@ export function createServer() {
       set.delete(poller);
       poller.res.end(JSON.stringify(batch));
     }
+    journal("batch_delivered", { key: entryKey });
     return true;
   }
 
@@ -291,6 +349,16 @@ export function createServer() {
         sentAt: Date.now(),
       })),
     };
+    // Archive before delivery: whatever happens downstream, the batch exists.
+    const archived = archiveBatch(session.entryKey, batch);
+    journal("batch_sent", {
+      key: session.entryKey,
+      file: targetOf(session.entryKey),
+      archive: archived,
+      pages: pages.length,
+      comments: pages.reduce((n, p) => n + p.comments.length, 0),
+      edits: pages.reduce((n, p) => n + p.edits.length, 0),
+    });
     batches.set(session.entryKey, record);
     store.setBatch(session.entryKey, record);
     record.delivered = deliver(session.entryKey, batch);
@@ -306,6 +374,7 @@ export function createServer() {
     if (!pending || !pending.delivered) return false;
     batches.delete(entryKey);
     store.clearBatch(entryKey);
+    journal("batch_acked", { key: entryKey });
     const stagedRoot = path.join(stateDir(), "pasted");
     for (const file of pending.cleanup.flatMap((entry) => entry.staged || [])) {
       const resolved = path.resolve(file);
@@ -336,6 +405,7 @@ export function createServer() {
    */
   function endSession(session) {
     sessions.delete(session.id);
+    store.removeSession(session.id);
     for (const res of session.clients) {
       res.write(`event: ended\ndata: {}\n\n`);
       res.end();
@@ -511,18 +581,21 @@ export function createServer() {
         }
         watchPage(page.key);
         const id = uid("s");
-        sessions.set(id, { id, entryKey: page.key, activeKey: page.key, visited: new Set([page.key]), clients: new Set(), lastSeen: Date.now() });
+        const session = { id, entryKey: page.key, activeKey: page.key, visited: new Set([page.key]), clients: new Set(), lastSeen: Date.now() };
+        sessions.set(id, session);
+        persistSession(session);
         return json(res, 200, { sessionId: id, key: page.key, path: `/s/${id}` });
       }
 
       // --- the chrome page
       if (route.startsWith("/s/")) {
         const id = route.slice(3);
-        if (!sessions.has(id)) {
+        const revived = getSession(id);
+        if (!revived) {
           res.writeHead(404, { "content-type": "text/plain" });
           return res.end("This review session has ended. Run human-review <target> again.");
         }
-        seen(sessions.get(id));
+        seen(revived);
         const shell = fs.readFileSync(path.join(here, "chrome.html"), "utf8");
         res.writeHead(200, { "content-type": MIME[".html"], "cache-control": "no-store" });
         return res.end(shell.replace("__SESSION_ID__", id).replace("__TOKEN__", token));
@@ -624,7 +697,7 @@ export function createServer() {
 
         if (!action && req.method === "GET") {
           const sid = url.searchParams.get("session");
-          const session = sid ? sessions.get(sid) : null;
+          const session = sid ? getSession(sid) : null;
           seen(session);
           const body = pageState(key, session);
           if (session) body.others = otherPages(session);
@@ -661,11 +734,13 @@ export function createServer() {
           };
           if (!comment.feedback) return json(res, 400, { error: "empty feedback" });
           store.addComment(key, comment);
+          journal("comment_added", { key, file: targetOf(key), id: comment.id, quote: comment.quote.slice(0, 120), feedback: comment.feedback.slice(0, 200) });
           return json(res, 200, { comment, page: pageState(key) });
         }
 
         if (action === "comment" && req.method === "DELETE") {
           store.removeComment(key, tail);
+          journal("comment_deleted", { key, file: targetOf(key), id: tail });
           return json(res, 200, { page: pageState(key) });
         }
 
@@ -705,6 +780,7 @@ export function createServer() {
             ...(stagedAssets.length ? { staged_assets: stagedAssets } : {}),
           };
           store.addEdit(key, label, kind, cap(body.before), cap(body.after), cap(body.before_html), cap(body.after_html), extra);
+          journal("edit_recorded", { key, file: targetOf(key), label, kind });
           return json(res, 200, { page: pageState(key) });
         }
 
@@ -765,6 +841,7 @@ export function createServer() {
           }
           try {
             const clean = writePage(key, body.html);
+            journal("file_saved", { key, file: targetOf(key) });
             return json(res, 200, { savedAt: Date.now(), hash: hash(clean) });
           } catch (err) {
             return json(res, 500, { error: String(err.message || err) });
@@ -777,6 +854,7 @@ export function createServer() {
           if (!page.pristine) return json(res, 400, { error: "nothing to revert to" });
           writePage(key, page.pristine);
           store.clearEdits(key);
+          journal("revert", { key, file: targetOf(key) });
           for (const session of sessionsForKey(key)) emit(session, "reload", { key });
           return json(res, 200, { page: pageState(key) });
         }
@@ -792,7 +870,7 @@ export function createServer() {
       // --- the user is done: stop the review, release the agent
       const endMatch = route.match(/^\/api\/session\/(\w+)\/end$/);
       if (endMatch && req.method === "POST") {
-        const session = sessions.get(endMatch[1]);
+        const session = getSession(endMatch[1]);
         if (!session) return json(res, 404, { error: "unknown session" });
         endSession(session);
         return json(res, 200, { ok: true });
@@ -801,7 +879,7 @@ export function createServer() {
       // --- which page a window is currently showing
       const bootMatch = route.match(/^\/api\/session\/(\w+)\/page$/);
       if (bootMatch && req.method === "GET") {
-        const session = sessions.get(bootMatch[1]);
+        const session = getSession(bootMatch[1]);
         if (!session) return json(res, 404, { error: "unknown session" });
         seen(session);
         return json(res, 200, {
@@ -814,20 +892,21 @@ export function createServer() {
       // --- jump straight to a page already in this window
       const gotoMatch = route.match(/^\/api\/session\/(\w+)\/goto$/);
       if (gotoMatch && req.method === "POST") {
-        const session = sessions.get(gotoMatch[1]);
+        const session = getSession(gotoMatch[1]);
         if (!session) return json(res, 404, { error: "unknown session" });
         seen(session);
         const body = await readBody(req);
         if (!store.page(body.key)) return json(res, 404, { error: "unknown page" });
         session.activeKey = body.key;
         session.visited.add(body.key);
+        persistSession(session);
         return json(res, 200, { key: body.key });
       }
 
       // --- navigation between local files or localhost routes in one window
       const navMatch = route.match(/^\/api\/session\/(\w+)\/navigate$/);
       if (navMatch && req.method === "POST") {
-        const session = sessions.get(navMatch[1]);
+        const session = getSession(navMatch[1]);
         if (!session) return json(res, 404, { error: "unknown session" });
         seen(session);
         const body = await readBody(req);
@@ -841,6 +920,7 @@ export function createServer() {
           const page = store.openUrl(target.value);
           session.activeKey = page.key;
           session.visited.add(page.key);
+          persistSession(session);
           return json(res, 200, { key: page.key, page: pageState(page.key) });
         }
         const targetFile = resolveAsset(from.file, String(body.href || "").split(/[?#]/)[0]);
@@ -853,12 +933,13 @@ export function createServer() {
         watchPage(page.key);
         session.activeKey = page.key;
         session.visited.add(page.key);
+        persistSession(session);
         return json(res, 200, { key: page.key, page: pageState(page.key) });
       }
 
       // --- server-sent events for one window
       if (route.startsWith("/events/")) {
-        const session = sessions.get(route.slice("/events/".length));
+        const session = getSession(route.slice("/events/".length));
         if (!session) {
           res.writeHead(404);
           return res.end();
@@ -887,9 +968,19 @@ export function createServer() {
         const entryKey = targetKey(target);
         if (url.searchParams.get("ack") === "1") ack(entryKey);
 
-        const pending = batches.get(entryKey);
+        // The in-memory map only saw batches this instance stored or loaded at
+        // start; a batch another instance persisted since is picked up here.
+        let pending = batches.get(entryKey);
+        if (!pending) {
+          const record = store.reloadBatch(entryKey);
+          if (record) {
+            pending = { batch: record.batch, cleanup: record.cleanup, delivered: false };
+            batches.set(entryKey, pending);
+          }
+        }
         if (pending) {
           pending.delivered = true;
+          journal("batch_delivered", { key: entryKey });
           broadcastAgent(entryKey);
           return json(res, 200, pending.batch);
         }
@@ -922,9 +1013,14 @@ export function createServer() {
   const sweep = setInterval(() => {
     const now = Date.now();
 
-    // A window with no SSE client for a while is closed; forget its session.
+    // A window with no SSE client for a while is closed; forget its session —
+    // unless it still guards unsent feedback or an unacked batch, which must
+    // stay reachable until the user or agent resolves it.
     for (const [id, session] of sessions) {
-      if (session.clients.size === 0 && now - session.lastSeen > SESSION_TTL_MS) sessions.delete(id);
+      if (session.clients.size > 0 || now - session.lastSeen <= SESSION_TTL_MS) continue;
+      if (sessionHasWork(session)) continue;
+      sessions.delete(id);
+      store.removeSession(id);
     }
 
     // Stop watching files no remaining session can see.
@@ -954,15 +1050,60 @@ export function createServer() {
   return { server, store, token, dispose };
 }
 
+/** Is the process already on this port a healthy human-review server? */
+function healthyOccupant(port) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: "127.0.0.1", port, path: "/health", timeout: 1500 }, (res) => {
+      let raw = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        raw += chunk;
+      });
+      res.on("end", () => {
+        try {
+          resolve(res.statusCode === 200 && JSON.parse(raw).ok === true);
+        } catch {
+          resolve(false);
+        }
+      });
+    });
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
 export function start(port = 0) {
   const { server, store, token, dispose } = createServer();
   return new Promise((resolve, reject) => {
-    // Without this, a busy HUMAN_REVIEW_PORT dies as an uncaught exception.
-    server.once("error", (err) => {
-      console.error(`human-review server could not listen on port ${port}: ${err.message}`);
-      reject(err);
-    });
-    server.listen(port, "127.0.0.1", () => {
+    const listen = (wanted, mayFallBack) => {
+      // Without this, a busy HUMAN_REVIEW_PORT dies as an uncaught exception.
+      server.once("error", async (err) => {
+        if (mayFallBack && err.code === "EADDRINUSE") {
+          // Our own healthy server (per this state dir's server.json) already
+          // owns the port: adopting it is the CLI's job, and two owners of
+          // server.json would be worse.
+          let recorded = null;
+          try {
+            recorded = JSON.parse(fs.readFileSync(serverPath(), "utf8"));
+          } catch {
+            // No record: whatever holds the port is not ours.
+          }
+          if (recorded?.port === wanted && (await healthyOccupant(wanted))) {
+            console.error(`human-review server already running on port ${wanted}.`);
+            return reject(err);
+          }
+          // A stranger squats the fixed port: fall back to a random one.
+          return listen(0, false);
+        }
+        console.error(`human-review server could not listen on port ${wanted}: ${err.message}`);
+        reject(err);
+      });
+      server.listen(wanted, "127.0.0.1", onListening);
+    };
+    const onListening = () => {
       const actual = server.address().port;
       ensureStateDir();
       fs.writeFileSync(serverPath(), JSON.stringify({ port: actual, pid: process.pid, token, protocol: SERVER_PROTOCOL }));
@@ -972,6 +1113,7 @@ export function start(port = 0) {
         // Windows has no meaningful chmod; the state dir mode covers it.
       }
       resolve({ server, store, port: actual, token, dispose });
-    });
+    };
+    listen(port, port !== 0);
   });
 }
