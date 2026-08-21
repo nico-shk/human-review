@@ -1,11 +1,11 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 
 // Bump this when the CLI and detached server no longer share the same request
 // contract. A new CLI must not silently reuse an older background server.
-export const SERVER_PROTOCOL = 8;
+export const SERVER_PROTOCOL = 9;
 
 export function stateDir() {
   const override = process.env.HUMAN_REVIEW_STATE_DIR;
@@ -18,6 +18,36 @@ export function statePath() {
 
 export function serverPath() {
   return path.join(stateDir(), "server.json");
+}
+
+export function tokenPath() {
+  return path.join(stateDir(), "token");
+}
+
+export function journalPath() {
+  return path.join(stateDir(), "journal.ndjson");
+}
+
+export function archiveDir() {
+  return path.join(stateDir(), "archive");
+}
+
+/**
+ * One secret per state dir, minted on first use and reused across server
+ * runs, so a restart never invalidates the token already injected into open
+ * review tabs.
+ */
+export function loadOrCreateToken() {
+  ensureStateDir();
+  try {
+    const saved = fs.readFileSync(tokenPath(), "utf8").trim();
+    if (/^[a-f0-9]{32,}$/.test(saved)) return saved;
+  } catch {
+    // No token yet; mint one below.
+  }
+  const token = randomBytes(16).toString("hex");
+  fs.writeFileSync(tokenPath(), `${token}\n`, { mode: 0o600 });
+  return token;
 }
 
 export function ensureStateDir() {

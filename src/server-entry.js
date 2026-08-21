@@ -1,6 +1,8 @@
 import { start } from "./server.js";
 
-const port = Number(process.env.HUMAN_REVIEW_PORT || 0);
+// Fixed default port, so review URLs survive server restarts. The env var
+// still wins, and a squatted port falls back to a random one (see start()).
+const port = Number(process.env.HUMAN_REVIEW_PORT || 8791);
 try {
   await start(port);
 } catch {
