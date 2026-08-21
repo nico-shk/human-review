@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { canonicalTarget, ensureStateDir, pageKey, realFile, statePath, targetKey } from "./paths.js";
+import { archiveDir, canonicalTarget, ensureStateDir, journalPath, pageKey, realFile, statePath, targetKey } from "./paths.js";
 
 /** Anything untouched this long is review debris, not work in progress. */
 const PRUNE_AGE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -31,8 +31,9 @@ export function atomicWrite(file, data) {
  *
  * Shape:
  *   {
- *     pages:   { <key>: { key, file, pristine, comments[], edits[], updatedAt } },
- *     batches: { <entryKey>: { batch, cleanup, updatedAt } },
+ *     pages:    { <key>: { key, file, pristine, comments[], edits[], updatedAt } },
+ *     batches:  { <entryKey>: { batch, cleanup, updatedAt } },
+ *     sessions: { <id>: { entryKey, activeKey, visited[], updatedAt } },
  *   }
  *
  * Pages are fully independent: no page ever references another. Batches are
@@ -41,9 +42,11 @@ export function atomicWrite(file, data) {
  */
 export class Store {
   constructor() {
-    this.data = { pages: {}, batches: {} };
+    this.data = { pages: {}, batches: {}, sessions: {} };
     /** Batches this process acked; save() must not resurrect them from disk. */
     this.clearedBatches = new Set();
+    /** Sessions this process ended; same resurrection guard as batches. */
+    this.clearedSessions = new Set();
     this.load();
   }
 
@@ -52,7 +55,7 @@ export class Store {
       const raw = fs.readFileSync(statePath(), "utf8");
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === "object" && parsed.pages) {
-        this.data = { pages: parsed.pages, batches: parsed.batches || {} };
+        this.data = { pages: parsed.pages, batches: parsed.batches || {}, sessions: parsed.sessions || {} };
       }
     } catch {
       // Missing or unreadable state is not an error; start empty.
@@ -74,6 +77,20 @@ export class Store {
     for (const [key, batch] of Object.entries(this.data.batches)) {
       if (!fresh(batch, now)) delete this.data.batches[key];
     }
+    for (const [id, session] of Object.entries(this.data.sessions || {})) {
+      // A session guarding unsent feedback or an unacked batch is never debris.
+      if (!fresh(session, now) && !this.sessionHasWork(session)) delete this.data.sessions[id];
+    }
+  }
+
+  /** Does this session still guard unsent comments/edits or a pending batch? */
+  sessionHasWork(session) {
+    if (this.data.batches[session.entryKey]) return true;
+    for (const key of session.visited || []) {
+      const page = this.data.pages[key];
+      if (page && (page.comments.length || page.edits.length)) return true;
+    }
+    return false;
   }
 
   /**
@@ -94,8 +111,10 @@ export class Store {
     const merged = {
       pages: { ...onDisk.pages, ...this.data.pages },
       batches: { ...onDisk.batches, ...this.data.batches },
+      sessions: { ...(onDisk.sessions || {}), ...(this.data.sessions || {}) },
     };
     for (const key of this.clearedBatches) delete merged.batches[key];
+    for (const id of this.clearedSessions) delete merged.sessions[id];
     // Age-prune the merged result too, so the file cannot grow without bound.
     const now = Date.now();
     for (const [key, page] of Object.entries(merged.pages)) {
@@ -103,6 +122,15 @@ export class Store {
     }
     for (const [key, batch] of Object.entries(merged.batches)) {
       if (!fresh(batch, now)) delete merged.batches[key];
+    }
+    for (const [id, session] of Object.entries(merged.sessions)) {
+      const busy =
+        merged.batches[session.entryKey] ||
+        (session.visited || []).some((key) => {
+          const page = merged.pages[key];
+          return page && (page.comments.length || page.edits.length);
+        });
+      if (!fresh(session, now) && !busy) delete merged.sessions[id];
     }
     atomicWrite(target, JSON.stringify(merged, null, 2));
   }
@@ -276,6 +304,76 @@ export class Store {
     delete this.data.batches[entryKey];
     this.clearedBatches.add(entryKey);
     this.save();
+  }
+
+  /**
+   * A batch persisted by another server instance after this one loaded is
+   * invisible to the in-memory copy. Re-reading just that key from disk makes
+   * such stranded feedback deliverable instead of lost.
+   */
+  reloadBatch(entryKey) {
+    if (this.clearedBatches.has(entryKey)) return null;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(statePath(), "utf8"));
+      const record = parsed && parsed.batches && parsed.batches[entryKey];
+      if (!record) return null;
+      this.data.batches[entryKey] = record;
+      return record;
+    } catch {
+      return null;
+    }
+  }
+
+  // Browser sessions, persisted so a server restart never kills open tabs.
+
+  allSessions() {
+    return this.data.sessions;
+  }
+
+  session(id) {
+    return this.data.sessions[id] || null;
+  }
+
+  setSession(id, { entryKey, activeKey, visited }) {
+    this.clearedSessions.delete(id);
+    this.data.sessions[id] = { entryKey, activeKey, visited: [...visited], updatedAt: Date.now() };
+    this.save();
+  }
+
+  removeSession(id) {
+    delete this.data.sessions[id];
+    this.clearedSessions.add(id);
+    this.save();
+  }
+}
+
+/**
+ * Append-only feedback journal: one JSON line per event, never pruned by the
+ * tool. Failures are swallowed — recording history must never break the
+ * review itself.
+ */
+export function journal(event, entry) {
+  try {
+    ensureStateDir();
+    fs.appendFileSync(journalPath(), `${JSON.stringify({ ts: new Date().toISOString(), event, ...entry })}\n`);
+  } catch {
+    // Journaling is best-effort by design.
+  }
+}
+
+/**
+ * Full copy of every sent batch, written before delivery and never deleted by
+ * the tool — ack clears the pending queue, not the archive.
+ */
+export function archiveBatch(entryKey, batch) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const name = `${stamp}-${entryKey}.json`;
+  try {
+    fs.mkdirSync(archiveDir(), { recursive: true });
+    atomicWrite(path.join(archiveDir(), name), JSON.stringify({ entryKey, archived_at: new Date().toISOString(), batch }, null, 2));
+    return name;
+  } catch {
+    return null;
   }
 }
 
