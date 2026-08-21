@@ -12,7 +12,8 @@ process.env.HUMAN_REVIEW_STATE_DIR = path.join(tmp, "state");
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const { start } = await import("../src/server.js");
-const { Store } = await import("../src/state.js");
+const storeExports = await import("../src/state.js");
+const { Store } = storeExports;
 const { archiveDir, journalPath } = await import("../src/paths.js");
 
 function request(server, method, route, body) {
@@ -101,7 +102,83 @@ test("a session record survives a server stop and start", async (t) => {
   t.after(() => second.dispose());
   const after = await request(second, "GET", opened.path);
   assert.equal(after.status, 200, after.raw);
-  assert.match(after.raw, /__SESSION_ID__|human-review|<html/i);
+  // The chrome shell must have the revived session's id substituted in.
+  assert.ok(after.raw.includes(opened.sessionId), "session id substituted into chrome page");
+  assert.ok(!after.raw.includes("__SESSION_ID__"), "placeholder replaced");
+});
+
+test("sessions from one store survive another store's save, including an old-server-shaped write", () => {
+  const { Store } = storeExports;
+  const A = new Store();
+  const B = new Store();
+  B.setSession("sB", { entryKey: "kB", activeKey: "kB", visited: ["kB"] });
+  A.setSession("sA", { entryKey: "kA", activeKey: "kA", visited: ["kA"] });
+  let disk = JSON.parse(fs.readFileSync(path.join(process.env.HUMAN_REVIEW_STATE_DIR, "state.json"), "utf8"));
+  assert.ok(disk.sessions.sB, "B's session survived A's save");
+  assert.ok(disk.sessions.sA);
+
+  // A pre-fork server's save() writes no sessions key at all; the next save
+  // from a new-protocol instance must restore its own sessions.
+  fs.writeFileSync(
+    path.join(process.env.HUMAN_REVIEW_STATE_DIR, "state.json"),
+    JSON.stringify({ pages: disk.pages, batches: disk.batches })
+  );
+  A.setSession("sA2", { entryKey: "kA", activeKey: "kA", visited: ["kA"] });
+  disk = JSON.parse(fs.readFileSync(path.join(process.env.HUMAN_REVIEW_STATE_DIR, "state.json"), "utf8"));
+  assert.ok(disk.sessions.sA, "A's session restored after an old-server write");
+  assert.ok(disk.sessions.sA2);
+});
+
+test("ack after a restart clears the delivered batch instead of re-serving it", async (t) => {
+  const file = path.join(tmp, "ack-restart.html");
+  fs.writeFileSync(file, "<p>Ack</p>");
+  const first = await start(0);
+  const opened = JSON.parse((await request(first, "POST", "/api/session", { target: file })).raw);
+  await request(first, "POST", `/api/page/${opened.key}/comment`, { kind: "selection", quote: "Ack", feedback: "once only" });
+  await request(first, "POST", `/api/page/${opened.key}/send`, { sessionId: opened.sessionId, note: "" });
+  const delivered = await request(first, "GET", `/api/poll?target=${encodeURIComponent(file)}`);
+  assert.ok(delivered.raw.includes("once only"), "batch delivered before restart");
+  first.dispose();
+
+  const second = await start(0);
+  t.after(() => second.dispose());
+  // The ack must clear the batch on disk; the poll then parks (no re-delivery),
+  // so give it a moment and inspect the store instead of awaiting the response.
+  const req = http.request({
+    host: "127.0.0.1",
+    port: second.port,
+    method: "GET",
+    path: `/api/poll?ack=1&target=${encodeURIComponent(file)}`,
+    headers: { "x-human-review-token": second.token },
+  });
+  req.on("error", () => {});
+  req.end();
+  await new Promise((r) => setTimeout(r, 500));
+  const disk = JSON.parse(fs.readFileSync(path.join(process.env.HUMAN_REVIEW_STATE_DIR, "state.json"), "utf8"));
+  assert.ok(!disk.batches[opened.key], "acked batch cleared on disk after restart");
+  req.destroy();
+});
+
+test("disk prune never expires a stale session guarding pending work", () => {
+  const { Store } = storeExports;
+  const file = path.join(tmp, "guard.html");
+  fs.writeFileSync(file, "<p>Guard</p>");
+  const store = new Store();
+  const { key } = store.openPage(file, "<p>Guard</p>");
+  store.addComment(key, { id: "cg", kind: "selection", quote: "Guard", feedback: "unsent" });
+  store.setSession("sGuard", { entryKey: key, activeKey: key, visited: [key] });
+  store.setSession("sIdle", { entryKey: "nowhere", activeKey: "nowhere", visited: [] });
+
+  const stateFile = path.join(process.env.HUMAN_REVIEW_STATE_DIR, "state.json");
+  const disk = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  const old = Date.now() - 40 * 24 * 60 * 60 * 1000;
+  disk.sessions.sGuard.updatedAt = old;
+  disk.sessions.sIdle.updatedAt = old;
+  fs.writeFileSync(stateFile, JSON.stringify(disk));
+
+  const reloaded = new Store();
+  assert.ok(reloaded.session("sGuard"), "stale session with unsent comments survives the prune");
+  assert.equal(reloaded.session("sIdle"), null, "stale session with no work is pruned");
 });
 
 test("poll picks up a batch another instance persisted after startup", async (t) => {

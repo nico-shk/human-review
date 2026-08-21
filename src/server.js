@@ -113,7 +113,7 @@ export function createServer() {
   const pollers = new Map(); // entryKey -> Set<{ res, timer }>
   /** Pending batches awaiting --ack; mirrored to the store so they survive restarts. */
   const batches = new Map(
-    Object.entries(store.allBatches()).map(([key, record]) => [key, { batch: record.batch, cleanup: record.cleanup, delivered: false }])
+    Object.entries(store.allBatches()).map(([key, record]) => [key, { batch: record.batch, cleanup: record.cleanup, delivered: !!record.delivered }])
   );
   const watched = new Map(); // key -> { file }
   const lastWritten = new Map(); // key -> content hash human-review itself wrote
@@ -183,7 +183,9 @@ export function createServer() {
 
   /** Does this window still guard unsent feedback or an unacked batch? */
   function sessionHasWork(session) {
-    if (batches.has(session.entryKey)) return true;
+    // Consult the disk too: a batch persisted by another instance must keep
+    // its session alive even though this instance never saw it.
+    if (batches.has(session.entryKey) || store.reloadBatch(session.entryKey)) return true;
     for (const key of session.visited) {
       const page = store.page(key);
       if (page && (page.comments.length || page.edits.length)) return true;
@@ -362,12 +364,23 @@ export function createServer() {
     batches.set(session.entryKey, record);
     store.setBatch(session.entryKey, record);
     record.delivered = deliver(session.entryKey, batch);
+    if (record.delivered) store.markBatchDelivered(session.entryKey);
     broadcastAgent(session.entryKey);
     return { ok: true };
   }
 
   function ack(entryKey) {
-    const pending = batches.get(entryKey);
+    let pending = batches.get(entryKey);
+    // The batch — and its delivered flag — may live only on disk, persisted by
+    // another instance or a previous run; without this read, that ack would be
+    // refused and the same batch re-served to the agent a second time.
+    if (!pending) {
+      const record = store.reloadBatch(entryKey);
+      if (record) {
+        pending = { batch: record.batch, cleanup: record.cleanup || [], delivered: !!record.delivered };
+        batches.set(entryKey, pending);
+      }
+    }
     // Only a delivered batch can be acknowledged. An agent whose previous poll
     // timed out re-runs `poll --ack`; if feedback arrived in between, that ack
     // refers to an older batch and must not destroy the one it never saw.
@@ -542,7 +555,7 @@ export function createServer() {
 
       if (route === "/health") return json(res, 200, { ok: true, pid: process.pid, protocol: SERVER_PROTOCOL });
 
-      // Every API route needs the per-run token; static assets and the
+      // Every API route needs the persistent token; static assets and the
       // unguessable /s/<id> chrome page do not.
       // Header only — a token in a query string would leak into logs and
       // history. Constant-time compare, so timing can't narrow the secret.
@@ -980,6 +993,7 @@ export function createServer() {
         }
         if (pending) {
           pending.delivered = true;
+          store.markBatchDelivered(entryKey);
           journal("batch_delivered", { key: entryKey });
           broadcastAgent(entryKey);
           return json(res, 200, pending.batch);
@@ -1061,7 +1075,10 @@ function healthyOccupant(port) {
       });
       res.on("end", () => {
         try {
-          resolve(res.statusCode === 200 && JSON.parse(raw).ok === true);
+          const parsed = JSON.parse(raw);
+          // An old-protocol server on the port is a stranger to us: falling
+          // back to a random port beats dead-ending the new server.
+          resolve(res.statusCode === 200 && parsed.ok === true && parsed.protocol === SERVER_PROTOCOL);
         } catch {
           resolve(false);
         }

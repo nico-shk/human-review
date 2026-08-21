@@ -85,11 +85,11 @@ Subscribe to my [YouTube channel](https://www.youtube.com/@PeterYangYT?sub_confi
 
 ## Durability (0.7.0 fork additions)
 
-This fork hardens review sessions and makes feedback loss structurally impossible:
+This fork hardens review sessions so that sent feedback is always recoverable — every sent batch is archived and journaled before delivery (note: `state.json` working state still prunes at 30 days; the archive and journal are what never expire):
 
 - **Sessions survive server restarts.** Browser sessions persist to `state.json` and revive on start; the server uses a fixed default port (8791, `HUMAN_REVIEW_PORT` overrides, falls back to a random port if squatted) and a persistent token, so open tabs keep working across restarts.
 - **Sessions never expire while feedback is pending.** The idle TTL is 7 days, and a session guarding unsent comments/edits or an unacked batch is never expired.
-- **Every sent batch is archived** to `~/.human-review/archive/` before delivery and never deleted by the tool; every feedback event is journaled append-only to `~/.human-review/journal.ndjson`.
+- **Every sent batch is archived** to `~/.human-review/archive/` before delivery and never deleted by the tool; every feedback event is journaled append-only to `~/.human-review/journal.ndjson`. Neither is pruned by the tool — they grow slowly (KBs/month at typical volume); delete old entries by hand if you ever care.
 - **`human-review history [target]`** lists archived batches (with ack status inferred from the journal); `--show <index-or-stamp>` prints one in full.
 - The CLI no longer spawns a duplicate server when the existing one is merely slow: while the recorded pid is alive it keeps retrying the health check for ~10s.
 

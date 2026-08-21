@@ -101,10 +101,12 @@ export class Store {
   save() {
     ensureStateDir();
     const target = statePath();
-    let onDisk = { pages: {}, batches: {} };
+    let onDisk = { pages: {}, batches: {}, sessions: {} };
     try {
       const parsed = JSON.parse(fs.readFileSync(target, "utf8"));
-      if (parsed && parsed.pages) onDisk = { pages: parsed.pages, batches: parsed.batches || {} };
+      // An older server's save() writes no sessions key at all; our in-memory
+      // copy re-merges them below, so such a write never wipes sessions.
+      if (parsed && parsed.pages) onDisk = { pages: parsed.pages, batches: parsed.batches || {}, sessions: parsed.sessions || {} };
     } catch {
       // No readable state yet; ours becomes the file.
     }
@@ -294,9 +296,21 @@ export class Store {
     return this.data.batches;
   }
 
-  setBatch(entryKey, { batch, cleanup }) {
+  setBatch(entryKey, { batch, cleanup, delivered }) {
     this.clearedBatches.delete(entryKey);
-    this.data.batches[entryKey] = { batch, cleanup, updatedAt: Date.now() };
+    this.data.batches[entryKey] = { batch, cleanup, delivered: !!delivered, updatedAt: Date.now() };
+    this.save();
+  }
+
+  /**
+   * Delivery is persisted so an ack arriving at another instance — or after a
+   * restart — is honored instead of re-serving the batch a second time.
+   */
+  markBatchDelivered(entryKey) {
+    const record = this.data.batches[entryKey];
+    if (!record || record.delivered) return;
+    record.delivered = true;
+    record.updatedAt = Date.now();
     this.save();
   }
 
